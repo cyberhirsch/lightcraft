@@ -400,7 +400,7 @@ fn with_smooth_tone(look: CameraLook) -> CameraLook {
     let Some(grid) = LogGrid::over(&own) else { return look };
     let ln = |y: f32| f64::from(y).max(1e-6).ln();
     let values: Vec<f64> = grid.xs.iter().map(|&x| ln(look.tone.apply(x))).collect();
-    let (first, last) = (values[0], values[TONE_GRID - 1]);
+    let (Some(&first), Some(&last)) = (values.first(), values.last()) else { return look };
     let slope: Vec<f64> = values.windows(2).map(|w| (w[1] - w[0]) / grid.step).collect();
     let smooth = blur_mirrored(&slope, TONE_SMOOTHING / grid.step);
     // Integrated back, scaled so that both ends stay where the fitted curve has them.
@@ -415,7 +415,8 @@ fn with_smooth_tone(look: CameraLook) -> CameraLook {
         y += s * grid.step * (last - first) / total;
         curve.push(y);
     }
-    let mut knots = grid.knots(&curve, own[31][1], |_| 1.0);
+    let [.., [_, own_end]] = own;
+    let mut knots = grid.knots(&curve, own_end, |_| 1.0);
     ease_shoulder(&mut knots, &own, |_| 1.0);
     match CameraTone::new(knots).and_then(|tone| tone.with_chroma(*look.tone.chroma())) {
         Some(tone) => CameraLook { tone, ..look },
@@ -447,7 +448,8 @@ fn with_dro_off_tone(look: CameraLook) -> CameraLook {
     let below: Vec<f64> = grid.xs.iter().zip(&sony).map(|(&x, s)| (ln(look.tone.apply(x)) - s).min(0.0)).collect();
     let curve: Vec<f64> = sony.iter().zip(blur_mirrored(&below, TONE_SMOOTHING / grid.step)).map(|(s, b)| s + b).collect();
     // never above the fitted curve
-    let mut knots = grid.knots(&curve, own[31][1].min(dro_off.apply(own[31][0])), |x| look.tone.apply(x));
+    let [.., [own_x, own_end]] = own;
+    let mut knots = grid.knots(&curve, own_end.min(dro_off.apply(own_x)), |x| look.tone.apply(x));
     ease_shoulder(&mut knots, &own, |x| look.tone.apply(x));
     let Some(tone) = CameraTone::new(knots).and_then(|tone| tone.with_chroma(*look.tone.chroma())) else { return look };
     if !at_most(&tone, &look.tone) {
@@ -480,7 +482,8 @@ struct LogGrid {
 
 impl LogGrid {
     fn over(knots: &[[f32; 2]; 32]) -> Option<LogGrid> {
-        let ends = [knots[0][0], knots[31][0]];
+        let [[first, _], .., [last, _]] = *knots;
+        let ends = [first, last];
         let (l0, l1) = (f64::from(ends[0]).ln(), f64::from(ends[1]).ln());
         let step = (l1 - l0) / (TONE_GRID - 1) as f64;
         (step.is_finite() && step > 0.0).then(|| LogGrid { xs: (0..TONE_GRID).map(|i| (l0 + i as f64 * step).exp() as f32).collect(), step, ends })
@@ -498,8 +501,8 @@ impl LogGrid {
             *knot = [x, y.max(previous).min(0.9999_f32.max(previous))];
             previous = knot[1];
         }
-        knots[0][0] = self.ends[0];
-        knots[31][0] = self.ends[1];
+        let [[first, _], .., [last, _]] = &mut knots;
+        (*first, *last) = (self.ends[0], self.ends[1]);
         knots
     }
 }
@@ -510,20 +513,22 @@ impl LogGrid {
 /// `own`'s, easing the raise into the knots below with a bell-shaped ramp (about a stop wide) so it
 /// doesn't bend the curve sharply either; no knot above `cap(x)`.
 fn ease_shoulder(knots: &mut [[f32; 2]; 32], own: &[[f32; 2]; 32], cap: impl Fn(f32) -> f32) {
-    let (a, b, end) = (own[30], own[31], knots[31]);
+    let [.., a, b] = *own;
+    let [.., second_last, end] = *knots;
     let rate = ((b[1] - a[1]) / (b[0] - a[0])).clamp(0.1, 16.0) / (1.0 - b[1]).max(0.01);
-    let floor = end[1] - rate * (1.0 - end[1]).max(0.01) * (end[0] - knots[30][0]);
-    let raised = knots[30][1].max(floor).min(end[1]);
-    let raise = f64::from(raised / knots[30][1].max(1e-6)).ln();
+    let floor = end[1] - rate * (1.0 - end[1]).max(0.01) * (end[0] - second_last[0]);
+    let raised = second_last[1].max(floor).min(end[1]);
+    let raise = f64::from(raised / second_last[1].max(1e-6)).ln();
     if raise.is_finite() && raise > 0.0 {
-        let top = f64::from(knots[30][0]).ln();
+        let top = f64::from(second_last[0]).ln();
         for knot in knots.iter_mut().take(30) {
             let d = (top - f64::from(knot[0]).ln()) / SHOULDER_RAMP;
             let lifted = knot[1] * (raise * (-0.5 * d * d).exp()).exp() as f32;
             knot[1] = lifted.min(cap(knot[0])).max(knot[1]);
         }
     }
-    knots[30][1] = raised;
+    let [.., [_, second_last_y], _] = knots;
+    *second_last_y = raised;
     let mut previous = 0.0_f32;
     for knot in knots.iter_mut() {
         knot[1] = knot[1].max(previous);
@@ -553,7 +558,9 @@ fn blur_mirrored(values: &[f64], sigma: f64) -> Vec<f64> {
     };
     (0..n as isize)
         .map(|i| {
-            let (mut sum, mut weight) = (kernel[0] * at(i), kernel[0]);
+            // the centre weight: `kernel` holds 0..=radius, so it is never empty
+            let centre = kernel.first().copied().unwrap_or(1.0);
+            let (mut sum, mut weight) = (centre * at(i), centre);
             for (k, w) in kernel.iter().enumerate().skip(1) {
                 let k = k as isize;
                 sum += w * (at(i - k) + at(i + k));
@@ -3223,8 +3230,9 @@ mod tests {
         let (k, own) = (fixed.tone.knots(), fitted.tone.knots());
         assert_eq!((k[0][0], k[31][0]), (own[0][0], own[31][0]), "{what}: the fitted curve's range");
         assert_eq!(k[31][1], own[31][1].min(dro_off.apply(own[31][0])), "{what}: last knot");
-        // never more than 20 % darker than the lower curve (the smooth bend where the curves cross
-        // runs a few percent below both; easing in the shoulder may raise it toward the fitted one)
+        // never more than 20 % darker than the lower curve: the smooth bend where the curves cross
+        // runs below both, by up to 3 % on real camera curves but up to 19 % on the sharpest random
+        // crossings below; easing in the shoulder may raise it toward the fitted one
         for i in 0..=400 {
             let x = own[0][0] * (own[31][0] / own[0][0]).powf(i as f32 / 400.0);
             let lowered = fitted.tone.apply(x).min(dro_off.apply(x));
@@ -3312,6 +3320,67 @@ mod tests {
         }
         for x in [0.6, 0.8, 1.2, 2.0, 4.0] {
             assert!(smooth.tone.apply(x) <= fitted.tone.apply(x) + 1e-5, "shoulder at {x}: {} > {}", smooth.tone.apply(x), fitted.tone.apply(x));
+        }
+    }
+
+    /// The tone curve fitted to an ILCE-7CM2 portrait shot with DRO Auto (32 knots, no pixels): its
+    /// log-log slope runs 1.49, 0.59, 1.31 and 0.66, 0.97, 2.49 over neighbouring segments at skin
+    /// luminance, which rendered skin as flat patches with hard edges. Smoothed, no segment is more
+    /// than 1.3 times as steep as its neighbour (but at the shoulder knot), and lowered to Sony's
+    /// DRO-off curve it stays smooth and below the fitted one.
+    #[test]
+    fn the_ilce7cm2_portrait_curve_is_smoothed_and_lowered_without_kinks() {
+        let fitted: [[f32; 2]; 32] = [
+            [0.0012956966, 0.00221796],
+            [0.0014438259, 0.002638999],
+            [0.0015556675, 0.0030083896],
+            [0.0016744382, 0.0034342238],
+            [0.0018214826, 0.0040767905],
+            [0.0019348101, 0.0045912904],
+            [0.0020698514, 0.005166734],
+            [0.0021889831, 0.005623345],
+            [0.0023529145, 0.0064242673],
+            [0.002629961, 0.008057135],
+            [0.0029332505, 0.009846472],
+            [0.0032898046, 0.011459229],
+            [0.0037383824, 0.013825513],
+            [0.004293154, 0.016470132],
+            [0.0048303693, 0.019744683],
+            [0.005949445, 0.024445456],
+            [0.008061339, 0.034742408],
+            [0.01000938, 0.047377687],
+            [0.01279278, 0.06405208],
+            [0.015697476, 0.08684758],
+            [0.02045475, 0.10148945],
+            [0.023688722, 0.12301771],
+            [0.026074195, 0.13528101],
+            [0.028168831, 0.14293653],
+            [0.029799942, 0.14777178],
+            [0.030998932, 0.15089494],
+            [0.03197965, 0.1540239],
+            [0.033079498, 0.15916447],
+            [0.033962604, 0.1699701],
+            [0.035201307, 0.18556753],
+            [0.038164012, 0.2243801],
+            [0.29724288, 0.5854368],
+        ];
+        let slopes = |k: &[[f32; 2]; 32]| -> Vec<f32> { k.windows(2).map(|w| (w[1][1] / w[0][1]).ln() / (w[1][0] / w[0][0]).ln()).collect() };
+        let kink = |s: &[f32]| s.windows(2).take(28).map(|w| w[0].max(w[1]) / w[0].min(w[1])).fold(0.0_f32, f32::max);
+        assert!(kink(&slopes(&fitted)) > 2.0, "the fitted curve has the kinks");
+        let mut look = dro_test_look(&fitted.map(|k| k[0]), &|x| x);
+        look.tone = CameraTone::new(fitted).unwrap().with_chroma(*look.tone.chroma()).unwrap();
+        let smooth = with_smooth_tone(look);
+        let k = smooth.tone.knots();
+        assert_eq!([k[0], k[31]], [fitted[0], fitted[31]]);
+        assert!(kink(&slopes(k)) <= 1.3, "slopes {:?}", slopes(k));
+        let lowered = with_dro_off_tone(smooth.clone());
+        assert_lowered(&smooth, &lowered, "ILCE-7CM2 portrait");
+        // on this real curve the bend where it crosses Sony's runs at most 4 % below the lower one
+        let dro_off = sony_dro_off_tone().unwrap();
+        for i in 0..=400 {
+            let x = fitted[0][0] * (fitted[31][0] / fitted[0][0]).powf(i as f32 / 400.0);
+            let lower = smooth.tone.apply(x).min(dro_off.apply(x));
+            assert!(lowered.tone.apply(x) >= 0.96 * lower, "at {x}: {} vs {lower}", lowered.tone.apply(x));
         }
     }
 
